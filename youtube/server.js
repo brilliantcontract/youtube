@@ -9,18 +9,23 @@ const DEFAULT_SCRAPE_NINJA_API_KEY = '455e2a6556msheffc310f7420b51p102ea0jsn1c53
 const SCRAPE_NINJA_API_KEY = process.env.SCRAPE_NINJA_API_KEY || DEFAULT_SCRAPE_NINJA_API_KEY;
 const DATABASE_BATCH_SIZE = 1000;
 const DEFAULT_DATABASE_URL_MAX_LENGTH = 255;
-let databaseUrlMaxLength = DEFAULT_DATABASE_URL_MAX_LENGTH;
-const DIRECT_ACCESS_TYPE = 'DIRECT';
-const PROXY_ACCESS_TYPE = 'PROXY';
-const DIRECT_FETCH_HEADERS = {
+const DIRECT_REQUEST_TIMEOUT_MS = 10000;
+const DIRECT_REQUEST_HEADERS = {
     'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
     'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache'
+    Pragma: 'no-cache',
+    Referer: 'https://www.youtube.com/',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1'
 };
-const PROXY_BLANK_DESCRIPTION_THRESHOLD = 5;
+let databaseUrlMaxLength = DEFAULT_DATABASE_URL_MAX_LENGTH;
 
 dotenv.config();
 
@@ -103,7 +108,7 @@ async function updateDatabaseUrlMaxLengthFromSchema(connection) {
             databaseUrlMaxLength = DEFAULT_DATABASE_URL_MAX_LENGTH;
             console.warn(
                 `Unexpected CHARACTER_MAXIMUM_LENGTH (${schemaLength}) for channels_abouts.url. ` +
-                    `Using default limit ${DEFAULT_DATABASE_URL_MAX_LENGTH}.`
+                `Using default limit ${DEFAULT_DATABASE_URL_MAX_LENGTH}.`
             );
             return;
         }
@@ -111,13 +116,13 @@ async function updateDatabaseUrlMaxLengthFromSchema(connection) {
         databaseUrlMaxLength = DEFAULT_DATABASE_URL_MAX_LENGTH;
         console.warn(
             `Could not retrieve CHARACTER_MAXIMUM_LENGTH for channels_abouts.url. ` +
-                `Using default limit ${DEFAULT_DATABASE_URL_MAX_LENGTH}.`
+            `Using default limit ${DEFAULT_DATABASE_URL_MAX_LENGTH}.`
         );
     } catch (err) {
         databaseUrlMaxLength = DEFAULT_DATABASE_URL_MAX_LENGTH;
         console.warn(
             `Failed to determine channels_abouts.url length limit from database. ` +
-                `Using default limit ${DEFAULT_DATABASE_URL_MAX_LENGTH}.`,
+            `Using default limit ${DEFAULT_DATABASE_URL_MAX_LENGTH}.`,
             err
         );
     }
@@ -145,7 +150,7 @@ function extractChannelInfo(html) {
         otherLinks: [],
         verification: null,
         accessType: null,
-        fetchAccessType: null
+        accessStatus: null
     };
 
     try {
@@ -191,7 +196,7 @@ function extractChannelInfo(html) {
         channelInfo.linkToTiktok = categorizedLinks.tiktok;
         channelInfo.otherLinks = categorizedLinks.other;
         channelInfo.verification = extractVerificationStatus(html);
-        channelInfo.accessType = extractAccessType(html);
+        channelInfo.accessStatus = extractAccessType(html);
         channelInfo.views = channelInfo.viewCount;
         channelInfo.videos = channelInfo.videoCount;
         channelInfo.joinDate = channelInfo.joinedDate;
@@ -285,32 +290,84 @@ function extractAccessType(html) {
     return 'public';
 }
 
-async function fetchDirectHtml(url) {
+function isLikelyYouTubeChannelHtml(html) {
+    if (!html) {
+        return false;
+    }
+
+    const normalizedHtml = html.trim();
+    if (!normalizedHtml) {
+        return false;
+    }
+
+    if (!/<html/i.test(normalizedHtml)) {
+        return false;
+    }
+
+    const markers = [
+        'channelAboutFullMetadataRenderer',
+        'ytInitialData',
+        'channelMetadataRenderer',
+        'ytInitialPlayerResponse'
+    ];
+
+    for (const marker of markers) {
+        if (normalizedHtml.includes(marker)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+async function fetchChannelDirectly(url) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+        controller.abort();
+    }, DIRECT_REQUEST_TIMEOUT_MS);
+
     try {
         const response = await fetch(url, {
-            headers: DIRECT_FETCH_HEADERS
+            method: 'GET',
+            headers: DIRECT_REQUEST_HEADERS,
+            redirect: 'follow',
+            signal: controller.signal
         });
 
         if (!response.ok) {
             return {
                 ok: false,
-                reason: `Direct access responded with status ${response.status} ${response.statusText}`
+                reason: `Direct request failed with status ${response.status} ${response.statusText}`
             };
         }
 
         const html = await response.text();
         if (!html || !html.trim()) {
-            return { ok: false, reason: 'Direct access returned an empty response body.' };
+            return { ok: false, reason: 'Direct request returned an empty response.' };
+        }
+
+        if (!isLikelyYouTubeChannelHtml(html)) {
+            return {
+                ok: false,
+                reason: 'Direct response did not include recognizable channel markup.'
+            };
         }
 
         return { ok: true, html };
     } catch (err) {
-        const message = err && err.message ? err.message : String(err);
+        const message =
+            err && err.name === 'AbortError'
+                ? 'Direct request timed out.'
+                : err && err.message
+                    ? err.message
+                    : String(err);
         return { ok: false, reason: message };
+    } finally {
+        clearTimeout(timeoutId);
     }
 }
 
-async function fetchViaScrapeNinja(url) {
+async function fetchWithScrapeNinja(url) {
     if (!SCRAPE_NINJA_API_KEY) {
         return { ok: false, reason: 'ScrapeNinja API key is not configured.' };
     }
@@ -352,7 +409,7 @@ async function fetchViaScrapeNinja(url) {
                     html = json.content;
                 }
             }
-        } catch {
+        } catch (jsonParseError) {
             html = '';
         }
 
@@ -372,30 +429,32 @@ async function fetchViaScrapeNinja(url) {
 }
 
 async function fetchHtml(url) {
-    const directResult = await fetchDirectHtml(url);
+    const directResult = await fetchChannelDirectly(url);
     if (directResult.ok) {
-        return { ok: true, html: directResult.html, accessType: DIRECT_ACCESS_TYPE };
+        return { ok: true, html: directResult.html, accessType: 'DIRECT' };
     }
 
     if (directResult.reason) {
         console.warn(`Direct access failed for ${url}: ${directResult.reason}`);
     }
 
-    const proxyResult = await fetchViaScrapeNinja(url);
+    const proxyResult = await fetchWithScrapeNinja(url);
     if (proxyResult.ok) {
-        return { ok: true, html: proxyResult.html, accessType: PROXY_ACCESS_TYPE };
+        return { ok: true, html: proxyResult.html, accessType: 'PROXY' };
     }
 
     const reasons = [];
     if (directResult.reason) {
-        reasons.push(`Direct access failed: ${directResult.reason}`);
+        reasons.push(`Direct: ${directResult.reason}`);
     }
     if (proxyResult.reason) {
-        reasons.push(`ScrapeNinja failed: ${proxyResult.reason}`);
+        reasons.push(`ScrapeNinja: ${proxyResult.reason}`);
     }
 
-    const reasonMessage = reasons.length ? reasons.join(' | ') : 'Unknown error fetching channel HTML.';
-    return { ok: false, reason: reasonMessage };
+    return {
+        ok: false,
+        reason: reasons.join(' | ') || 'Unknown error fetching channel HTML.'
+    };
 }
 
 
@@ -434,8 +493,6 @@ async function scrapeNotScrapedChannels() {
         let offset = 0;
         let batchNumber = 1;
         let totalProcessed = 0;
-        let consecutiveProxyBlankDescriptions = 0;
-        let stopDueToProxyBlankDescriptions = false;
 
         while (true) {
             const normalizedOffsetCandidate = Math.floor(Number(offset));
@@ -459,9 +516,7 @@ async function scrapeNotScrapedChannels() {
                 `Fetch new records to scrape from database (batch ${batchNumber}, offset ${selectOffset}): ${rows.length}`
             );
 
-            let processedThisBatch = 0;
             for (const row of rows) {
-                processedThisBatch += 1;
                 const normalizedUrl = ensureFullYouTubeUrl(row.url);
                 if (!normalizedUrl) {
                     continue;
@@ -480,28 +535,13 @@ async function scrapeNotScrapedChannels() {
                 }
 
                 const info = extractChannelInfo(result.html);
-                info.fetchAccessType = result.accessType || DIRECT_ACCESS_TYPE;
-
-                const descriptionText = (info.description || '').trim();
-                if (info.fetchAccessType === PROXY_ACCESS_TYPE) {
-                    if (!descriptionText) {
-                        consecutiveProxyBlankDescriptions += 1;
-                        if (consecutiveProxyBlankDescriptions >= PROXY_BLANK_DESCRIPTION_THRESHOLD) {
-                            console.error(
-                                `Potential ScrapeNinja block detected: ${consecutiveProxyBlankDescriptions} consecutive blank descriptions received while using the proxy. Halting scraping for review.`
-                            );
-                            stopDueToProxyBlankDescriptions = true;
-                        }
-                    } else {
-                        consecutiveProxyBlankDescriptions = 0;
-                    }
-                } else {
-                    consecutiveProxyBlankDescriptions = 0;
+                info.accessType = result.accessType || 'DIRECT';
+                if (!info.accessStatus) {
+                    info.accessStatus = 'public';
                 }
-
                 const otherLinksJson = info.otherLinks?.length ? JSON.stringify(info.otherLinks) : null;
                 await connection.execute(
-                `INSERT INTO channels_abouts (
+                    `INSERT INTO channels_abouts (
                     url,
                     description,
                     videos,
@@ -529,52 +569,36 @@ async function scrapeNotScrapedChannels() {
                     verification = VALUES(verification),
                     thumbnail = VALUES(thumbnail),
                     access_type = VALUES(access_type)`,
-                [
-                    truncateForDatabaseUrl(normalizedUrl),
-                    info.description || null,
-                    info.videoCount || info.videos || null,
-                    info.viewCount || info.views || null,
-                    info.joinedDate || info.joinDate || null,
-                    info.linkToInstagram || null,
-                    info.linkToFacebook || null,
-                    info.linkToTwitter || null,
-                    info.linkToTiktok || null,
-                    otherLinksJson,
-                    info.verification || 'Unverified',
-                    info.thumbnail || '',
-                    info.fetchAccessType || DIRECT_ACCESS_TYPE
-                ]
-            );
+                    [
+                        truncateForDatabaseUrl(normalizedUrl),
+                        info.description || null,
+                        info.videoCount || info.videos || null,
+                        info.viewCount || info.views || null,
+                        info.joinedDate || info.joinDate || null,
+                        info.linkToInstagram || null,
+                        info.linkToFacebook || null,
+                        info.linkToTwitter || null,
+                        info.linkToTiktok || null,
+                        otherLinksJson,
+                        info.verification || 'Unverified',
+                        info.thumbnail || '',
+                        info.accessType || 'DIRECT'
+                    ]
+                );
 
-            console.log(
-                `Channel ${channelUrl} was scraped and stored using ${info.fetchAccessType} access.`
-            );
-
-            if (stopDueToProxyBlankDescriptions) {
-                break;
-            }
+                console.log(`Channel ${channelUrl} was scraped via ${info.accessType} and stored.`);
             }
 
-            totalProcessed += processedThisBatch;
-            offset = selectOffset + processedThisBatch;
+            totalProcessed += rows.length;
+            offset = selectOffset + rows.length;
             batchNumber += 1;
-
-            if (stopDueToProxyBlankDescriptions) {
-                break;
-            }
 
             if (rows.length < batchSize) {
                 break;
             }
         }
 
-        if (stopDueToProxyBlankDescriptions) {
-            console.error(
-                `Scraping stopped due to suspected ScrapeNinja blocking after processing ${totalProcessed} channel(s).`
-            );
-        } else {
-            console.log(`SCRAPING PROCESS COMPLETED!!! Total processed: ${totalProcessed}`);
-        }
+        console.log(`SCRAPING PROCESS COMPLETED!!! Total processed: ${totalProcessed}`);
     } catch (err) {
         console.error('Database scraping error:', err);
     } finally {
@@ -640,16 +664,17 @@ const server = http.createServer((req, res) => {
             const result = await fetchHtml(channelUrl);
             if (result.ok) {
                 const channelInfo = extractChannelInfo(result.html);
-                channelInfo.fetchAccessType = result.accessType || DIRECT_ACCESS_TYPE;
+                channelInfo.accessType = result.accessType || 'DIRECT';
+                if (!channelInfo.accessStatus) {
+                    channelInfo.accessStatus = 'public';
+                }
                 if (!channelInfo.title && !channelInfo.channelId) {
                     res.end(JSON.stringify({
                         success: false,
                         error: 'Could not extract channel information. The channel may not exist or be private.'
                     }));
                 } else {
-                    console.log(
-                        `Manual scraping succeeded for: ${channelUrl} using ${channelInfo.fetchAccessType} access.`
-                    );
+                    console.log(`Manual scraping succeeded for: ${channelUrl}`);
                     res.end(JSON.stringify({ success: true, channelInfo }));
                 }
             } else {

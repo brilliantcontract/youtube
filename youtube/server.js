@@ -540,53 +540,60 @@ async function scrapeNotScrapedChannels() {
                     info.accessStatus = 'public';
                 }
                 const otherLinksJson = info.otherLinks?.length ? JSON.stringify(info.otherLinks) : null;
-                await connection.execute(
-                    `INSERT INTO channels_abouts (
-                    url,
-                    description,
-                    videos,
-                    views,
-                    join_date,
-                    link_to_instagram,
-                    link_to_facebook,
-                    link_to_twitter,
-                    link_to_tiktok,
-                    other_links,
-                    verification,
-                    thumbnail,
-                    access_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE
-                    description = VALUES(description),
-                    videos = VALUES(videos),
-                    views = VALUES(views),
-                    join_date = VALUES(join_date),
-                    link_to_instagram = VALUES(link_to_instagram),
-                    link_to_facebook = VALUES(link_to_facebook),
-                    link_to_twitter = VALUES(link_to_twitter),
-                    link_to_tiktok = VALUES(link_to_tiktok),
-                    other_links = VALUES(other_links),
-                    verification = VALUES(verification),
-                    thumbnail = VALUES(thumbnail),
-                    access_type = VALUES(access_type)`,
-                    [
-                        truncateForDatabaseUrl(normalizedUrl),
-                        info.description || null,
-                        info.videoCount || info.videos || null,
-                        info.viewCount || info.views || null,
-                        info.joinedDate || info.joinDate || null,
-                        info.linkToInstagram || null,
-                        info.linkToFacebook || null,
-                        info.linkToTwitter || null,
-                        info.linkToTiktok || null,
-                        otherLinksJson,
-                        info.verification || 'Unverified',
-                        info.thumbnail || '',
-                        info.accessType || 'DIRECT'
-                    ]
-                );
+                try {
+                    await connection.execute(
+                        `INSERT INTO channels_abouts (
+                        url,
+                        description,
+                        videos,
+                        views,
+                        join_date,
+                        link_to_instagram,
+                        link_to_facebook,
+                        link_to_twitter,
+                        link_to_tiktok,
+                        other_links,
+                        verification,
+                        thumbnail,
+                        access_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON DUPLICATE KEY UPDATE
+                        description = VALUES(description),
+                        videos = VALUES(videos),
+                        views = VALUES(views),
+                        join_date = VALUES(join_date),
+                        link_to_instagram = VALUES(link_to_instagram),
+                        link_to_facebook = VALUES(link_to_facebook),
+                        link_to_twitter = VALUES(link_to_twitter),
+                        link_to_tiktok = VALUES(link_to_tiktok),
+                        other_links = VALUES(other_links),
+                        verification = VALUES(verification),
+                        thumbnail = VALUES(thumbnail),
+                        access_type = VALUES(access_type)`,
+                        [
+                            truncateForDatabaseUrl(normalizedUrl),
+                            info.description || null,
+                            info.videoCount || info.videos || null,
+                            info.viewCount || info.views || null,
+                            info.joinedDate || info.joinDate || null,
+                            info.linkToInstagram || null,
+                            info.linkToFacebook || null,
+                            info.linkToTwitter || null,
+                            info.linkToTiktok || null,
+                            otherLinksJson,
+                            info.verification || 'Unverified',
+                            info.thumbnail || '',
+                            info.accessType || 'DIRECT'
+                        ]
+                    );
 
-                console.log(`Channel ${channelUrl} was scraped via ${info.accessType} and stored.`);
+                    console.log(`Channel ${channelUrl} was scraped via ${info.accessType} and stored.`);
+                } catch (dbErr) {
+                    console.error(
+                        `Database error while storing channel ${channelUrl}. The scraper will continue with the next channel.`,
+                        dbErr
+                    );
+                }
             }
 
             totalProcessed += rows.length;

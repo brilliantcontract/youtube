@@ -279,6 +279,14 @@ async function fetchHtml(url) {
 async function scrapeNotScrapedChannels() {
     let connection;
     let mysql;
+    const parsedBatchSize = Math.floor(Number(DATABASE_BATCH_SIZE));
+    const batchSize = Number.isNaN(parsedBatchSize) || parsedBatchSize <= 0 ? 0 : parsedBatchSize;
+    if (batchSize <= 0) {
+        console.warn(
+            `DATABASE_BATCH_SIZE must be a positive integer. Current value: ${DATABASE_BATCH_SIZE}`
+        );
+        return;
+    }
     try {
         mysql = (await import('mysql2/promise')).default;
     } catch (err) {
@@ -303,9 +311,14 @@ async function scrapeNotScrapedChannels() {
         let totalProcessed = 0;
 
         while (true) {
-            const [rows] = await connection.execute(
-                'SELECT url, query FROM not_scraped_channels ORDER BY url LIMIT ? OFFSET ?',
-                [DATABASE_BATCH_SIZE, offset]
+            const normalizedOffsetCandidate = Math.floor(Number(offset));
+            const normalizedOffset =
+                Number.isNaN(normalizedOffsetCandidate) || normalizedOffsetCandidate < 0
+                    ? 0
+                    : normalizedOffsetCandidate;
+            const selectOffset = normalizedOffset;
+            const [rows] = await connection.query(
+                `SELECT url, query FROM not_scraped_channels ORDER BY url LIMIT ${batchSize} OFFSET ${selectOffset}`
             );
 
             if (!rows.length) {
@@ -316,7 +329,7 @@ async function scrapeNotScrapedChannels() {
             }
 
             console.log(
-                `Fetch new records to scrape from database (batch ${batchNumber}, offset ${offset}): ${rows.length}`
+                `Fetch new records to scrape from database (batch ${batchNumber}, offset ${selectOffset}): ${rows.length}`
             );
 
             for (const row of rows) {
@@ -389,10 +402,10 @@ async function scrapeNotScrapedChannels() {
             }
 
             totalProcessed += rows.length;
-            offset += rows.length;
+            offset = selectOffset + rows.length;
             batchNumber += 1;
 
-            if (rows.length < DATABASE_BATCH_SIZE) {
+            if (rows.length < batchSize) {
                 break;
             }
         }

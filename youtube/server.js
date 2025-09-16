@@ -8,7 +8,8 @@ const SCRAPE_NINJA_HOST = 'scrapeninja.p.rapidapi.com';
 const DEFAULT_SCRAPE_NINJA_API_KEY = '455e2a6556msheffc310f7420b51p102ea0jsn1c531be1e299';
 const SCRAPE_NINJA_API_KEY = process.env.SCRAPE_NINJA_API_KEY || DEFAULT_SCRAPE_NINJA_API_KEY;
 const DATABASE_BATCH_SIZE = 1000;
-const DATABASE_URL_MAX_LENGTH = 255;
+const DEFAULT_DATABASE_URL_MAX_LENGTH = 255;
+let databaseUrlMaxLength = DEFAULT_DATABASE_URL_MAX_LENGTH;
 
 dotenv.config();
 
@@ -45,12 +46,70 @@ function truncateForDatabaseUrl(url) {
         return '';
     }
 
-    if (url.length <= DATABASE_URL_MAX_LENGTH) {
+    const limitCandidate = databaseUrlMaxLength;
+    if (!Number.isFinite(limitCandidate)) {
         return url;
     }
 
-    console.warn(`URL exceeds database column limit (${DATABASE_URL_MAX_LENGTH}). It will be truncated: ${url}`);
-    return url.slice(0, DATABASE_URL_MAX_LENGTH);
+    const normalizedLimit = Math.floor(limitCandidate);
+    if (normalizedLimit <= 0) {
+        return url;
+    }
+
+    if (url.length <= normalizedLimit) {
+        return url;
+    }
+
+    console.warn(`URL exceeds database column limit (${normalizedLimit}). It will be truncated: ${url}`);
+    return url.slice(0, normalizedLimit);
+}
+
+async function updateDatabaseUrlMaxLengthFromSchema(connection) {
+    try {
+        const [rows] = await connection.query(
+            `SELECT CHARACTER_MAXIMUM_LENGTH AS max_length FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+                AND table_name = 'channels_abouts'
+                AND column_name = 'url'
+            LIMIT 1`
+        );
+
+        if (Array.isArray(rows) && rows.length > 0) {
+            const schemaLength = rows[0].max_length;
+            if (schemaLength === null || typeof schemaLength === 'undefined') {
+                databaseUrlMaxLength = Infinity;
+                console.log('Detected unlimited length for channels_abouts.url column. URLs will not be truncated.');
+                return;
+            }
+
+            const parsedLength = Math.floor(Number(schemaLength));
+            if (Number.isFinite(parsedLength) && parsedLength > 0) {
+                databaseUrlMaxLength = parsedLength;
+                console.log(`Detected channels_abouts.url max length: ${parsedLength}`);
+                return;
+            }
+
+            databaseUrlMaxLength = DEFAULT_DATABASE_URL_MAX_LENGTH;
+            console.warn(
+                `Unexpected CHARACTER_MAXIMUM_LENGTH (${schemaLength}) for channels_abouts.url. ` +
+                    `Using default limit ${DEFAULT_DATABASE_URL_MAX_LENGTH}.`
+            );
+            return;
+        }
+
+        databaseUrlMaxLength = DEFAULT_DATABASE_URL_MAX_LENGTH;
+        console.warn(
+            `Could not retrieve CHARACTER_MAXIMUM_LENGTH for channels_abouts.url. ` +
+                `Using default limit ${DEFAULT_DATABASE_URL_MAX_LENGTH}.`
+        );
+    } catch (err) {
+        databaseUrlMaxLength = DEFAULT_DATABASE_URL_MAX_LENGTH;
+        console.warn(
+            `Failed to determine channels_abouts.url length limit from database. ` +
+                `Using default limit ${DEFAULT_DATABASE_URL_MAX_LENGTH}.`,
+            err
+        );
+    }
 }
 
 
@@ -305,6 +364,8 @@ async function scrapeNotScrapedChannels() {
         });
 
         console.log('Database connected');
+
+        await updateDatabaseUrlMaxLengthFromSchema(connection);
 
         let offset = 0;
         let batchNumber = 1;

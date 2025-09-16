@@ -1,0 +1,55 @@
+logs/*
+data-files/*
+*.pdf
+*.mp3
+*.mp4
+*.avi
+*.ics
+
+# Java files
+*.class
+*.ics
+*.marker
+*.lombok
+*.log
+logs.*.xml
+*/target/*
+*target/*
+*.jar
+*.war
+
+# JavaFX files
+*.xsb
+*.xsd
+
+# Multimedia files
+*.mp3
+*.mp4
+*.avi
+
+# Archive files
+*.zip
+*.rar
+*.gz
+*.tar
+*.tar.gz
+
+# Image files
+*.png
+*.gif
+*.jpg
+*.jpeg
+
+# My generic files
+input-*.csv
+input-*.xml
+output-*.csv
+output-*.xml
+*.csv
+
+# Temporary and backup files
+*.*~
+*.tmp
+/iframe-extractor/nbproject/
+/iframe-extractor-web/nbproject/
+/library-cli/nbproject/

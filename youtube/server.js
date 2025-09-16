@@ -19,6 +19,7 @@ const CHANNEL_BATCH_SIZE =
 const CHANNEL_FETCH_LIMIT =
     Number.isNaN(SCRAPE_DB_LIMIT_ENV) || SCRAPE_DB_LIMIT_ENV <= 0 ? 1000 : SCRAPE_DB_LIMIT_ENV;
 const DEFAULT_URL_MAX_LENGTH = 255;
+const URL_TRUNCATION_RETRY_LIMIT = 10;
 
 
 function ensureFullYouTubeUrl(url) {
@@ -144,16 +145,29 @@ async function getColumnMaximumLength(connection, schema, table, column) {
 
     try {
         const [rows] = await connection.execute(
-            `SELECT CHARACTER_MAXIMUM_LENGTH AS maxLength
+            `SELECT CHARACTER_MAXIMUM_LENGTH AS charMaxLength,
+                    CHARACTER_OCTET_LENGTH AS octetMaxLength,
+                    COLUMN_TYPE AS columnType
              FROM information_schema.columns
              WHERE table_schema = ? AND table_name = ? AND column_name = ?
              LIMIT 1`,
             [schema, table, column]
         );
         if (rows && rows.length) {
-            const value = Number(rows[0].maxLength);
-            if (Number.isFinite(value) && value > 0) {
-                return value;
+            const row = rows[0];
+            const charLength = Number(row.charMaxLength);
+            if (Number.isFinite(charLength) && charLength > 0) {
+                return charLength;
+            }
+
+            const parsedFromType = parseColumnLength(row.columnType);
+            if (parsedFromType) {
+                return parsedFromType;
+            }
+
+            const octetLength = Number(row.octetMaxLength);
+            if (Number.isFinite(octetLength) && octetLength > 0) {
+                return octetLength;
             }
         }
     } catch (err) {
@@ -163,6 +177,139 @@ async function getColumnMaximumLength(connection, schema, table, column) {
     }
 
     return null;
+}
+
+function parseColumnLength(columnType) {
+    if (!columnType || typeof columnType !== 'string') {
+        return null;
+    }
+
+    const match = columnType.match(/\((\d+)\)/);
+    if (!match) {
+        return null;
+    }
+
+    const length = Number(match[1]);
+    if (!Number.isFinite(length) || length <= 0) {
+        return null;
+    }
+
+    return length;
+}
+
+function determineNextLengthLimit(currentLimit, currentUrlLength) {
+    const limitIsValid = Number.isFinite(currentLimit) && currentLimit > 0;
+    const urlLengthIsValid = Number.isFinite(currentUrlLength) && currentUrlLength > 0;
+
+    let base = limitIsValid ? currentLimit : 0;
+    if (!base && urlLengthIsValid) {
+        base = currentUrlLength;
+    }
+    if (!base || base <= 1) {
+        return 1;
+    }
+
+    let next = Math.floor(base / 2);
+    if (next <= 0) {
+        next = 1;
+    }
+
+    if (urlLengthIsValid && next >= currentUrlLength) {
+        next = Math.max(Math.floor(currentUrlLength / 2), 1);
+    }
+
+    if (next >= base) {
+        next = base > 1 ? base - 1 : 1;
+    }
+
+    if (!Number.isFinite(next) || next <= 0) {
+        return 1;
+    }
+
+    return next;
+}
+
+async function removeScrapedChannel(connection, row) {
+    if (!connection || !row || !row.url) {
+        return;
+    }
+
+    try {
+        let sql = 'DELETE FROM not_scraped_channels WHERE url = ?';
+        const params = [row.url];
+
+        if (Object.prototype.hasOwnProperty.call(row, 'query')) {
+            sql += ' AND (query <=> ?)';
+            params.push(row.query === undefined ? null : row.query);
+        }
+
+        sql += ' LIMIT 1';
+
+        await connection.execute(sql, params);
+    } catch (err) {
+        console.warn(
+            `Failed to remove scraped channel from queue (${row.url}): ${err && err.message ? err.message : err}`
+        );
+    }
+}
+
+async function executeChannelInsert(connection, storageUrl, info, otherLinksJson) {
+    const params = [
+        storageUrl,
+        info.description || null,
+        info.videoCount || info.videos || null,
+        info.viewCount || info.views || null,
+        info.joinedDate || info.joinDate || null,
+        info.linkToInstagram || null,
+        info.linkToFacebook || null,
+        info.linkToTwitter || null,
+        info.linkToTiktok || null,
+        otherLinksJson,
+        info.verification || 'Unverified',
+        info.thumbnail || '',
+        info.accessType || 'public'
+    ];
+
+    const sql =
+        `INSERT INTO channels_abouts (
+                    url,
+                    description,
+                    videos,
+                    views,
+                    join_date,
+                    link_to_instagram,
+                    link_to_facebook,
+                    link_to_twitter,
+                    link_to_tiktok,
+                    other_links,
+                    verification,
+                    thumbnail,
+                    access_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                    description = VALUES(description),
+                    videos = VALUES(videos),
+                    views = VALUES(views),
+                    join_date = VALUES(join_date),
+                    link_to_instagram = VALUES(link_to_instagram),
+                    link_to_facebook = VALUES(link_to_facebook),
+                    link_to_twitter = VALUES(link_to_twitter),
+                    link_to_tiktok = VALUES(link_to_tiktok),
+                    other_links = VALUES(other_links),
+                    verification = VALUES(verification),
+                    thumbnail = VALUES(thumbnail),
+                    access_type = VALUES(access_type)`;
+
+    try {
+        await connection.execute(sql, params);
+        return { ok: true, url: storageUrl };
+    } catch (err) {
+        if (err && err.code === 'ER_DATA_TOO_LONG') {
+            return { ok: false, reason: 'length-exceeded', error: err };
+        }
+
+        throw err;
+    }
 }
 
 async function scrapeChannelRow(connection, row, urlMaxLength) {
@@ -192,58 +339,59 @@ async function scrapeChannelRow(connection, row, urlMaxLength) {
         storageUrl = clampUrlLength(storageUrl, urlMaxLength);
     }
 
-    try {
-        await connection.execute(
-            `INSERT INTO channels_abouts (
-                    url,
-                    description,
-                    videos,
-                    views,
-                    join_date,
-                    link_to_instagram,
-                    link_to_facebook,
-                    link_to_twitter,
-                    link_to_tiktok,
-                    other_links,
-                    verification,
-                    thumbnail,
-                    access_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE
-                    description = VALUES(description),
-                    videos = VALUES(videos),
-                    views = VALUES(views),
-                    join_date = VALUES(join_date),
-                    link_to_instagram = VALUES(link_to_instagram),
-                    link_to_facebook = VALUES(link_to_facebook),
-                    link_to_twitter = VALUES(link_to_twitter),
-                    link_to_tiktok = VALUES(link_to_tiktok),
-                    other_links = VALUES(other_links),
-                    verification = VALUES(verification),
-                    thumbnail = VALUES(thumbnail),
-                    access_type = VALUES(access_type)`,
-            [
-                storageUrl,
-                info.description || null,
-                info.videoCount || info.videos || null,
-                info.viewCount || info.views || null,
-                info.joinedDate || info.joinDate || null,
-                info.linkToInstagram || null,
-                info.linkToFacebook || null,
-                info.linkToTwitter || null,
-                info.linkToTiktok || null,
-                otherLinksJson,
-                info.verification || 'Unverified',
-                info.thumbnail || '',
-                info.accessType || 'public'
-            ]
-        );
-        console.log(`Channel ${channelUrl} was scraped and stored.`);
-        return true;
-    } catch (err) {
-        console.error(`Failed to store channel ${channelUrl}: ${err && err.message ? err.message : err}`);
-        return false;
+    let attemptUrl = storageUrl;
+    let attemptMaxLength = urlMaxLength;
+
+    for (let attempt = 0; attempt < URL_TRUNCATION_RETRY_LIMIT; attempt += 1) {
+        try {
+            const result = await executeChannelInsert(connection, attemptUrl, info, otherLinksJson);
+            if (result.ok) {
+                await removeScrapedChannel(connection, row);
+                console.log(`Channel ${channelUrl} was scraped and stored.`);
+                return true;
+            }
+
+            if (result.reason === 'length-exceeded') {
+                const nextMax = determineNextLengthLimit(
+                    attemptMaxLength || DEFAULT_URL_MAX_LENGTH,
+                    attemptUrl ? attemptUrl.length : 0
+                );
+                attemptUrl = clampUrlLength(attemptUrl, nextMax);
+                if (attemptUrl.length > nextMax) {
+                    attemptUrl = attemptUrl.slice(0, nextMax);
+                }
+                attemptMaxLength = nextMax;
+                console.warn(
+                    `Retrying insert for ${channelUrl} with truncated URL (length ${attemptUrl.length}).`
+                );
+                continue;
+            }
+        } catch (err) {
+            if (err && err.code === 'ER_DATA_TOO_LONG') {
+                const nextMax = determineNextLengthLimit(
+                    attemptMaxLength || DEFAULT_URL_MAX_LENGTH,
+                    attemptUrl ? attemptUrl.length : 0
+                );
+                attemptUrl = clampUrlLength(attemptUrl, nextMax);
+                if (attemptUrl.length > nextMax) {
+                    attemptUrl = attemptUrl.slice(0, nextMax);
+                }
+                attemptMaxLength = nextMax;
+                console.warn(
+                    `Retrying insert for ${channelUrl} after catching length error. New length limit: ${nextMax}.`
+                );
+                continue;
+            }
+
+            console.error(`Failed to store channel ${channelUrl}: ${err && err.message ? err.message : err}`);
+            return false;
+        }
     }
+
+    console.error(
+        `Failed to store channel ${channelUrl}: exceeded retry limit when truncating URL to fit database column.`
+    );
+    return false;
 }
 
 function extractChannelInfo(html) {

@@ -7,6 +7,8 @@ const SCRAPE_NINJA_ENDPOINT = 'https://scrapeninja.p.rapidapi.com/scrape';
 const SCRAPE_NINJA_HOST = 'scrapeninja.p.rapidapi.com';
 const DEFAULT_SCRAPE_NINJA_API_KEY = '455e2a6556msheffc310f7420b51p102ea0jsn1c531be1e299';
 const SCRAPE_NINJA_API_KEY = process.env.SCRAPE_NINJA_API_KEY || DEFAULT_SCRAPE_NINJA_API_KEY;
+const DATABASE_BATCH_SIZE = 1000;
+const DATABASE_URL_MAX_LENGTH = 255;
 
 dotenv.config();
 
@@ -37,6 +39,20 @@ function ensureFullYouTubeUrl(url) {
 
     return `https://www.youtube.com/${normalized}`;
 }
+
+function truncateForDatabaseUrl(url) {
+    if (!url) {
+        return '';
+    }
+
+    if (url.length <= DATABASE_URL_MAX_LENGTH) {
+        return url;
+    }
+
+    console.warn(`URL exceeds database column limit (${DATABASE_URL_MAX_LENGTH}). It will be truncated: ${url}`);
+    return url.slice(0, DATABASE_URL_MAX_LENGTH);
+}
+
 
 function extractChannelInfo(html) {
     const channelInfo = {
@@ -282,32 +298,48 @@ async function scrapeNotScrapedChannels() {
 
         console.log('Database connected');
 
-        const [rows] = await connection.execute('SELECT url, query FROM not_scraped_channels LIMIT 1000');
-        console.log(`Fetch new records to scrape from database: ${rows.length}`);
-        if (!rows.length) {
-            console.log('No new records found to scrape.');
-        }
-        for (const row of rows) {
-            const normalizedUrl = ensureFullYouTubeUrl(row.url);
-            if (!normalizedUrl) {
-                continue;
+        let offset = 0;
+        let batchNumber = 1;
+        let totalProcessed = 0;
+
+        while (true) {
+            const [rows] = await connection.execute(
+                'SELECT url, query FROM not_scraped_channels ORDER BY url LIMIT ? OFFSET ?',
+                [DATABASE_BATCH_SIZE, offset]
+            );
+
+            if (!rows.length) {
+                if (totalProcessed === 0) {
+                    console.log('No new records found to scrape.');
+                }
+                break;
             }
 
-            let channelUrl = normalizedUrl.replace(/\/+$/, '');
-            if (!channelUrl.includes('/about')) {
-                channelUrl += '/about';
-            }
+            console.log(
+                `Fetch new records to scrape from database (batch ${batchNumber}, offset ${offset}): ${rows.length}`
+            );
 
-            console.log(`Scraping channel: ${channelUrl}`);
-            const result = await fetchHtml(channelUrl);
-            if (!result.ok) {
-                console.error(`Failed to fetch channel ${channelUrl}: ${result.reason}`);
-                continue;
-            }
+            for (const row of rows) {
+                const normalizedUrl = ensureFullYouTubeUrl(row.url);
+                if (!normalizedUrl) {
+                    continue;
+                }
 
-            const info = extractChannelInfo(result.html);
-            const otherLinksJson = info.otherLinks?.length ? JSON.stringify(info.otherLinks) : null;
-            await connection.execute(
+                let channelUrl = normalizedUrl.replace(/\/+$/, '');
+                if (!channelUrl.includes('/about')) {
+                    channelUrl += '/about';
+                }
+
+                console.log(`Scraping channel: ${channelUrl}`);
+                const result = await fetchHtml(channelUrl);
+                if (!result.ok) {
+                    console.error(`Failed to fetch channel ${channelUrl}: ${result.reason}`);
+                    continue;
+                }
+
+                const info = extractChannelInfo(result.html);
+                const otherLinksJson = info.otherLinks?.length ? JSON.stringify(info.otherLinks) : null;
+                await connection.execute(
                 `INSERT INTO channels_abouts (
                     url,
                     description,
@@ -337,7 +369,7 @@ async function scrapeNotScrapedChannels() {
                     thumbnail = VALUES(thumbnail),
                     access_type = VALUES(access_type)`,
                 [
-                    normalizedUrl,
+                    truncateForDatabaseUrl(normalizedUrl),
                     info.description || null,
                     info.videoCount || info.videos || null,
                     info.viewCount || info.views || null,
@@ -352,11 +384,20 @@ async function scrapeNotScrapedChannels() {
                     info.accessType || 'public'
                 ]
             );
-            
+
             console.log(`Channel ${channelUrl} was scraped and stored.`);
+            }
+
+            totalProcessed += rows.length;
+            offset += rows.length;
+            batchNumber += 1;
+
+            if (rows.length < DATABASE_BATCH_SIZE) {
+                break;
+            }
         }
 
-        console.log('SCRAPING PROCESS COMPLETED!!!');
+        console.log(`SCRAPING PROCESS COMPLETED!!! Total processed: ${totalProcessed}`);
     } catch (err) {
         console.error('Database scraping error:', err);
     } finally {
@@ -370,7 +411,6 @@ async function scrapeNotScrapedChannels() {
         }
     }
 }
-
 
 const server = http.createServer((req, res) => {
     res.setHeader('Content-Type', 'application/json');

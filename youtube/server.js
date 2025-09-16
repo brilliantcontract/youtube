@@ -18,7 +18,7 @@ const CHANNEL_BATCH_SIZE =
     Number.isNaN(SCRAPE_BATCH_SIZE_ENV) || SCRAPE_BATCH_SIZE_ENV <= 0 ? 10 : SCRAPE_BATCH_SIZE_ENV;
 const CHANNEL_FETCH_LIMIT =
     Number.isNaN(SCRAPE_DB_LIMIT_ENV) || SCRAPE_DB_LIMIT_ENV <= 0 ? 1000 : SCRAPE_DB_LIMIT_ENV;
-const DEFAULT_URL_MAX_LENGTH = 512;
+const DEFAULT_URL_MAX_LENGTH = 255;
 
 
 function ensureFullYouTubeUrl(url) {
@@ -80,6 +80,31 @@ function stripAboutSuffix(url) {
     return url.replace(/\/about(?:\/)?$/i, '');
 }
 
+function safelyDecodeUrl(url) {
+    if (!url) {
+        return '';
+    }
+
+    try {
+        return decodeURI(url);
+    } catch (err) {
+        console.warn(`Failed to decode URL "${url}": ${err && err.message ? err.message : err}`);
+        return url;
+    }
+}
+
+function clampUrlLength(url, urlMaxLength) {
+    if (!url || !urlMaxLength || url.length <= urlMaxLength) {
+        return url || '';
+    }
+
+    const truncated = url.slice(0, urlMaxLength);
+    console.warn(
+        `Channel URL exceeded maximum length (${urlMaxLength}). Truncating to fit database column. Original length: ${url.length}.`
+    );
+    return truncated;
+}
+
 function buildStorageUrl(normalizedUrl, info, urlMaxLength) {
     const sanitizedNormalized = stripAboutSuffix(normalizedUrl);
     const candidates = [];
@@ -93,21 +118,23 @@ function buildStorageUrl(normalizedUrl, info, urlMaxLength) {
     candidates.push(sanitizedNormalized);
 
     for (const candidate of candidates) {
-        if (candidate && (!urlMaxLength || candidate.length <= urlMaxLength)) {
-            return candidate;
+        if (!candidate) {
+            continue;
+        }
+
+        const decodedCandidate = safelyDecodeUrl(candidate);
+        if (!urlMaxLength || decodedCandidate.length <= urlMaxLength) {
+            return decodedCandidate;
         }
     }
 
     const fallback = candidates.find(candidate => candidate) || sanitizedNormalized;
-    if (urlMaxLength && fallback.length > urlMaxLength) {
-        const truncated = fallback.slice(0, urlMaxLength);
-        console.warn(
-            `Channel URL exceeded maximum length (${urlMaxLength}). Truncating to fit database column. Original length: ${fallback.length}.`
-        );
-        return truncated;
+    const decodedFallback = safelyDecodeUrl(fallback);
+    if (!decodedFallback) {
+        return '';
     }
 
-    return fallback;
+    return clampUrlLength(decodedFallback, urlMaxLength);
 }
 
 async function getColumnMaximumLength(connection, schema, table, column) {
@@ -160,7 +187,10 @@ async function scrapeChannelRow(connection, row, urlMaxLength) {
 
     const info = extractChannelInfo(result.html);
     const otherLinksJson = info.otherLinks && info.otherLinks.length ? JSON.stringify(info.otherLinks) : null;
-    const storageUrl = buildStorageUrl(normalizedUrl, info, urlMaxLength);
+    let storageUrl = buildStorageUrl(normalizedUrl, info, urlMaxLength);
+    if (storageUrl && urlMaxLength && storageUrl.length > urlMaxLength) {
+        storageUrl = clampUrlLength(storageUrl, urlMaxLength);
+    }
 
     try {
         await connection.execute(

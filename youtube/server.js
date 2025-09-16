@@ -3,23 +3,12 @@ import { fileURLToPath } from 'url';
 
 import dotenv from 'dotenv';
 
-dotenv.config();
-
 const SCRAPE_NINJA_ENDPOINT = 'https://scrapeninja.p.rapidapi.com/scrape';
 const SCRAPE_NINJA_HOST = 'scrapeninja.p.rapidapi.com';
 const DEFAULT_SCRAPE_NINJA_API_KEY = '455e2a6556msheffc310f7420b51p102ea0jsn1c531be1e299';
 const SCRAPE_NINJA_API_KEY = process.env.SCRAPE_NINJA_API_KEY || DEFAULT_SCRAPE_NINJA_API_KEY;
-const SCRAPE_BATCH_SIZE_ENV = Number.parseInt(process.env.SCRAPE_BATCH_SIZE || '10', 10);
-const SCRAPE_DB_LIMIT_ENV = Number.parseInt(
-    process.env.SCRAPE_DB_LIMIT || process.env.SCRAPE_FETCH_LIMIT || '1000',
-    10
-);
-const CHANNEL_BATCH_SIZE =
-    Number.isNaN(SCRAPE_BATCH_SIZE_ENV) || SCRAPE_BATCH_SIZE_ENV <= 0 ? 10 : SCRAPE_BATCH_SIZE_ENV;
-const CHANNEL_FETCH_LIMIT =
-    Number.isNaN(SCRAPE_DB_LIMIT_ENV) || SCRAPE_DB_LIMIT_ENV <= 0 ? 1000 : SCRAPE_DB_LIMIT_ENV;
-const DEFAULT_URL_MAX_LENGTH = 255;
-const URL_TRUNCATION_RETRY_LIMIT = 10;
+
+dotenv.config();
 
 
 function ensureFullYouTubeUrl(url) {
@@ -47,351 +36,6 @@ function ensureFullYouTubeUrl(url) {
     }
 
     return `https://www.youtube.com/${normalized}`;
-}
-
-function ensureAboutSectionUrl(url) {
-    if (!url) {
-        return '';
-    }
-
-    let sanitized = url.trim();
-    if (!sanitized) {
-        return '';
-    }
-
-    const hashIndex = sanitized.indexOf('#');
-    let hash = '';
-    if (hashIndex !== -1) {
-        hash = sanitized.slice(hashIndex);
-        sanitized = sanitized.slice(0, hashIndex);
-    }
-
-    sanitized = sanitized.replace(/\/+$/, '');
-    if (!sanitized.toLowerCase().includes('/about')) {
-        sanitized += '/about';
-    }
-
-    return `${sanitized}${hash}`;
-}
-
-function stripAboutSuffix(url) {
-    if (!url) {
-        return '';
-    }
-    return url.replace(/\/about(?:\/)?$/i, '');
-}
-
-function safelyDecodeUrl(url) {
-    if (!url) {
-        return '';
-    }
-
-    try {
-        return decodeURI(url);
-    } catch (err) {
-        console.warn(`Failed to decode URL "${url}": ${err && err.message ? err.message : err}`);
-        return url;
-    }
-}
-
-function clampUrlLength(url, urlMaxLength) {
-    if (!url || !urlMaxLength || url.length <= urlMaxLength) {
-        return url || '';
-    }
-
-    const truncated = url.slice(0, urlMaxLength);
-    console.warn(
-        `Channel URL exceeded maximum length (${urlMaxLength}). Truncating to fit database column. Original length: ${url.length}.`
-    );
-    return truncated;
-}
-
-function buildStorageUrl(normalizedUrl, info, urlMaxLength) {
-    const sanitizedNormalized = stripAboutSuffix(normalizedUrl);
-    const candidates = [];
-
-    if (info && info.canonicalUrl) {
-        candidates.push(stripAboutSuffix(ensureFullYouTubeUrl(info.canonicalUrl)));
-    }
-    if (info && info.channelId) {
-        candidates.push(stripAboutSuffix(`https://www.youtube.com/channel/${info.channelId}`));
-    }
-    candidates.push(sanitizedNormalized);
-
-    for (const candidate of candidates) {
-        if (!candidate) {
-            continue;
-        }
-
-        const decodedCandidate = safelyDecodeUrl(candidate);
-        if (!urlMaxLength || decodedCandidate.length <= urlMaxLength) {
-            return decodedCandidate;
-        }
-    }
-
-    const fallback = candidates.find(candidate => candidate) || sanitizedNormalized;
-    const decodedFallback = safelyDecodeUrl(fallback);
-    if (!decodedFallback) {
-        return '';
-    }
-
-    return clampUrlLength(decodedFallback, urlMaxLength);
-}
-
-async function getColumnMaximumLength(connection, schema, table, column) {
-    if (!connection || !schema || !table || !column) {
-        return null;
-    }
-
-    try {
-        const [rows] = await connection.execute(
-            `SELECT CHARACTER_MAXIMUM_LENGTH AS charMaxLength,
-                    CHARACTER_OCTET_LENGTH AS octetMaxLength,
-                    COLUMN_TYPE AS columnType
-             FROM information_schema.columns
-             WHERE table_schema = ? AND table_name = ? AND column_name = ?
-             LIMIT 1`,
-            [schema, table, column]
-        );
-        if (rows && rows.length) {
-            const row = rows[0];
-            const charLength = Number(row.charMaxLength);
-            if (Number.isFinite(charLength) && charLength > 0) {
-                return charLength;
-            }
-
-            const parsedFromType = parseColumnLength(row.columnType);
-            if (parsedFromType) {
-                return parsedFromType;
-            }
-
-            const octetLength = Number(row.octetMaxLength);
-            if (Number.isFinite(octetLength) && octetLength > 0) {
-                return octetLength;
-            }
-        }
-    } catch (err) {
-        console.warn(
-            `Unable to determine maximum length for ${table}.${column}: ${err && err.message ? err.message : err}`
-        );
-    }
-
-    return null;
-}
-
-function parseColumnLength(columnType) {
-    if (!columnType || typeof columnType !== 'string') {
-        return null;
-    }
-
-    const match = columnType.match(/\((\d+)\)/);
-    if (!match) {
-        return null;
-    }
-
-    const length = Number(match[1]);
-    if (!Number.isFinite(length) || length <= 0) {
-        return null;
-    }
-
-    return length;
-}
-
-function determineNextLengthLimit(currentLimit, currentUrlLength) {
-    const limitIsValid = Number.isFinite(currentLimit) && currentLimit > 0;
-    const urlLengthIsValid = Number.isFinite(currentUrlLength) && currentUrlLength > 0;
-
-    let base = limitIsValid ? currentLimit : 0;
-    if (!base && urlLengthIsValid) {
-        base = currentUrlLength;
-    }
-    if (!base || base <= 1) {
-        return 1;
-    }
-
-    let next = Math.floor(base / 2);
-    if (next <= 0) {
-        next = 1;
-    }
-
-    if (urlLengthIsValid && next >= currentUrlLength) {
-        next = Math.max(Math.floor(currentUrlLength / 2), 1);
-    }
-
-    if (next >= base) {
-        next = base > 1 ? base - 1 : 1;
-    }
-
-    if (!Number.isFinite(next) || next <= 0) {
-        return 1;
-    }
-
-    return next;
-}
-
-async function removeScrapedChannel(connection, row) {
-    if (!connection || !row || !row.url) {
-        return;
-    }
-
-    try {
-        let sql = 'DELETE FROM not_scraped_channels WHERE url = ?';
-        const params = [row.url];
-
-        if (Object.prototype.hasOwnProperty.call(row, 'query')) {
-            sql += ' AND (query <=> ?)';
-            params.push(row.query === undefined ? null : row.query);
-        }
-
-        sql += ' LIMIT 1';
-
-        await connection.execute(sql, params);
-    } catch (err) {
-        console.warn(
-            `Failed to remove scraped channel from queue (${row.url}): ${err && err.message ? err.message : err}`
-        );
-    }
-}
-
-async function executeChannelInsert(connection, storageUrl, info, otherLinksJson) {
-    const params = [
-        storageUrl,
-        info.description || null,
-        info.videoCount || info.videos || null,
-        info.viewCount || info.views || null,
-        info.joinedDate || info.joinDate || null,
-        info.linkToInstagram || null,
-        info.linkToFacebook || null,
-        info.linkToTwitter || null,
-        info.linkToTiktok || null,
-        otherLinksJson,
-        info.verification || 'Unverified',
-        info.thumbnail || '',
-        info.accessType || 'public'
-    ];
-
-    const sql =
-        `INSERT INTO channels_abouts (
-                    url,
-                    description,
-                    videos,
-                    views,
-                    join_date,
-                    link_to_instagram,
-                    link_to_facebook,
-                    link_to_twitter,
-                    link_to_tiktok,
-                    other_links,
-                    verification,
-                    thumbnail,
-                    access_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE
-                    description = VALUES(description),
-                    videos = VALUES(videos),
-                    views = VALUES(views),
-                    join_date = VALUES(join_date),
-                    link_to_instagram = VALUES(link_to_instagram),
-                    link_to_facebook = VALUES(link_to_facebook),
-                    link_to_twitter = VALUES(link_to_twitter),
-                    link_to_tiktok = VALUES(link_to_tiktok),
-                    other_links = VALUES(other_links),
-                    verification = VALUES(verification),
-                    thumbnail = VALUES(thumbnail),
-                    access_type = VALUES(access_type)`;
-
-    try {
-        await connection.execute(sql, params);
-        return { ok: true, url: storageUrl };
-    } catch (err) {
-        if (err && err.code === 'ER_DATA_TOO_LONG') {
-            return { ok: false, reason: 'length-exceeded', error: err };
-        }
-
-        throw err;
-    }
-}
-
-async function scrapeChannelRow(connection, row, urlMaxLength) {
-    if (!row) {
-        return false;
-    }
-
-    const normalizedUrl = ensureFullYouTubeUrl(row.url);
-    if (!normalizedUrl) {
-        console.warn('Skipping entry with empty URL from not_scraped_channels.');
-        return false;
-    }
-
-    const channelUrl = ensureAboutSectionUrl(normalizedUrl);
-    console.log(`Scraping channel: ${channelUrl}`);
-
-    const result = await fetchHtml(channelUrl);
-    if (!result.ok) {
-        console.error(`Failed to fetch channel ${channelUrl}: ${result.reason}`);
-        return false;
-    }
-
-    const info = extractChannelInfo(result.html);
-    const otherLinksJson = info.otherLinks && info.otherLinks.length ? JSON.stringify(info.otherLinks) : null;
-    let storageUrl = buildStorageUrl(normalizedUrl, info, urlMaxLength);
-    if (storageUrl && urlMaxLength && storageUrl.length > urlMaxLength) {
-        storageUrl = clampUrlLength(storageUrl, urlMaxLength);
-    }
-
-    let attemptUrl = storageUrl;
-    let attemptMaxLength = urlMaxLength;
-
-    for (let attempt = 0; attempt < URL_TRUNCATION_RETRY_LIMIT; attempt += 1) {
-        try {
-            const result = await executeChannelInsert(connection, attemptUrl, info, otherLinksJson);
-            if (result.ok) {
-                await removeScrapedChannel(connection, row);
-                console.log(`Channel ${channelUrl} was scraped and stored.`);
-                return true;
-            }
-
-            if (result.reason === 'length-exceeded') {
-                const nextMax = determineNextLengthLimit(
-                    attemptMaxLength || DEFAULT_URL_MAX_LENGTH,
-                    attemptUrl ? attemptUrl.length : 0
-                );
-                attemptUrl = clampUrlLength(attemptUrl, nextMax);
-                if (attemptUrl.length > nextMax) {
-                    attemptUrl = attemptUrl.slice(0, nextMax);
-                }
-                attemptMaxLength = nextMax;
-                console.warn(
-                    `Retrying insert for ${channelUrl} with truncated URL (length ${attemptUrl.length}).`
-                );
-                continue;
-            }
-        } catch (err) {
-            if (err && err.code === 'ER_DATA_TOO_LONG') {
-                const nextMax = determineNextLengthLimit(
-                    attemptMaxLength || DEFAULT_URL_MAX_LENGTH,
-                    attemptUrl ? attemptUrl.length : 0
-                );
-                attemptUrl = clampUrlLength(attemptUrl, nextMax);
-                if (attemptUrl.length > nextMax) {
-                    attemptUrl = attemptUrl.slice(0, nextMax);
-                }
-                attemptMaxLength = nextMax;
-                console.warn(
-                    `Retrying insert for ${channelUrl} after catching length error. New length limit: ${nextMax}.`
-                );
-                continue;
-            }
-
-            console.error(`Failed to store channel ${channelUrl}: ${err && err.message ? err.message : err}`);
-            return false;
-        }
-    }
-
-    console.error(
-        `Failed to store channel ${channelUrl}: exceeded retry limit when truncating URL to fit database column.`
-    );
-    return false;
 }
 
 function extractChannelInfo(html) {
@@ -629,74 +273,87 @@ async function scrapeNotScrapedChannels() {
     }
     try {
         console.log('Starting database scraping process...');
-        const dbConfig = {
+        connection = await mysql.createConnection({
             host: process.env.DB_HOST || '3.17.216.88',
             user: process.env.DB_USER || 'root',
             password: process.env.DB_PASSWORD || 'RootSecret1!',
             database: process.env.DB_NAME || 'youtube'
-        };
-
-        connection = await mysql.createConnection(dbConfig);
+        });
 
         console.log('Database connected');
 
-        const urlMaxLength =
-            (await getColumnMaximumLength(connection, dbConfig.database, 'channels_abouts', 'url')) ||
-            DEFAULT_URL_MAX_LENGTH;
-
-        let totalStored = 0;
-        let iteration = 0;
-
-        while (true) {
-            iteration += 1;
-            const [rows] = await connection.execute('SELECT url, query FROM not_scraped_channels LIMIT ?', [
-                CHANNEL_FETCH_LIMIT
-            ]);
-            console.log(`Fetch new records to scrape from database: ${rows.length}`);
-
-            if (!rows.length) {
-                if (iteration === 1) {
-                    console.log('No new records found to scrape.');
-                }
-                break;
+        const [rows] = await connection.execute('SELECT url, query FROM not_scraped_channels LIMIT 1000');
+        console.log(`Fetch new records to scrape from database: ${rows.length}`);
+        if (!rows.length) {
+            console.log('No new records found to scrape.');
+        }
+        for (const row of rows) {
+            const normalizedUrl = ensureFullYouTubeUrl(row.url);
+            if (!normalizedUrl) {
+                continue;
             }
 
-            const iterationStart = totalStored;
-            const totalBatches = Math.ceil(rows.length / CHANNEL_BATCH_SIZE) || 1;
-
-            for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
-                const batchStart = batchIndex * CHANNEL_BATCH_SIZE;
-                const batch = rows.slice(batchStart, batchStart + CHANNEL_BATCH_SIZE);
-                console.log(
-                    `Processing batch ${batchIndex + 1} of ${totalBatches} (${batch.length} channels)...`
-                );
-
-                let batchSuccesses = 0;
-
-                for (const row of batch) {
-                    const success = await scrapeChannelRow(connection, row, urlMaxLength);
-                    if (success) {
-                        batchSuccesses += 1;
-                        totalStored += 1;
-                    }
-                }
-
-                console.log(
-                    `Batch ${batchIndex + 1} completed. Successful scrapes: ${batchSuccesses}/${batch.length}.`
-                );
+            let channelUrl = normalizedUrl.replace(/\/+$/, '');
+            if (!channelUrl.includes('/about')) {
+                channelUrl += '/about';
             }
 
-            const processedInIteration = totalStored - iterationStart;
-            if (processedInIteration === 0) {
-                console.warn(
-                    'No channels were stored during this iteration. Halting further attempts to avoid repetition.'
-                );
-                break;
+            console.log(`Scraping channel: ${channelUrl}`);
+            const result = await fetchHtml(channelUrl);
+            if (!result.ok) {
+                console.error(`Failed to fetch channel ${channelUrl}: ${result.reason}`);
+                continue;
             }
 
-            if (rows.length < CHANNEL_FETCH_LIMIT) {
-                break;
-            }
+            const info = extractChannelInfo(result.html);
+            const otherLinksJson = info.otherLinks?.length ? JSON.stringify(info.otherLinks) : null;
+            await connection.execute(
+                `INSERT INTO channels_abouts (
+                    url,
+                    description,
+                    videos,
+                    views,
+                    join_date,
+                    link_to_instagram,
+                    link_to_facebook,
+                    link_to_twitter,
+                    link_to_tiktok,
+                    other_links,
+                    verification,
+                    thumbnail,
+                    access_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                    description = VALUES(description),
+                    videos = VALUES(videos),
+                    views = VALUES(views),
+                    join_date = VALUES(join_date),
+                    link_to_instagram = VALUES(link_to_instagram),
+                    link_to_facebook = VALUES(link_to_facebook),
+                    link_to_twitter = VALUES(link_to_twitter),
+                    link_to_tiktok = VALUES(link_to_tiktok),
+                    other_links = VALUES(other_links),
+                    verification = VALUES(verification),
+                    thumbnail = VALUES(thumbnail),
+                    access_type = VALUES(access_type)`,
+                [
+                    normalizedUrl,
+                    info.description || null,
+                    info.videoCount || info.videos || null,
+                    info.viewCount || info.views || null,
+                    info.joinedDate || info.joinDate || null,
+                    info.linkToInstagram || null,
+                    info.linkToFacebook || null,
+                    info.linkToTwitter || null,
+                    info.linkToTiktok || null,
+                    otherLinksJson,
+                    info.verification || 'Unverified',
+                    info.thumbnail || '',
+                    info.accessType || 'public'
+                ]
+            );
+            
+            console.log(`Channel ${channelUrl} was scraped and stored.`);
         }
 
         console.log('SCRAPING PROCESS COMPLETED!!!');
@@ -758,7 +415,10 @@ const server = http.createServer((req, res) => {
                 return;
             }
 
-            channelUrl = ensureAboutSectionUrl(channelUrl);
+            channelUrl = channelUrl.replace(/\/+$/, '');
+            if (!channelUrl.includes('/about')) {
+                channelUrl += '/about';
+            }
 
             const result = await fetchHtml(channelUrl);
             if (result.ok) {

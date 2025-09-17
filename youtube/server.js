@@ -493,8 +493,6 @@ async function scrapeNotScrapedChannels() {
         let offset = 0;
         let batchNumber = 1;
         let totalProcessed = 0;
-        const randomSeed = `${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
-        console.log(`Randomizing database fetch order with seed: ${randomSeed}`);
 
         while (true) {
             const normalizedOffsetCandidate = Math.floor(Number(offset));
@@ -503,11 +501,8 @@ async function scrapeNotScrapedChannels() {
                     ? 0
                     : normalizedOffsetCandidate;
             const selectOffset = normalizedOffset;
-            const [rows] = await connection.execute(
-                `SELECT url, query FROM not_scraped_channels
-                ORDER BY MD5(CONCAT_WS('#', url, ?, query))
-                LIMIT ? OFFSET ?`,
-                [randomSeed, batchSize, selectOffset]
+            const [rows] = await connection.query(
+                `SELECT url, query FROM not_scraped_channels ORDER BY url LIMIT ${batchSize} OFFSET ${selectOffset}`
             );
 
             if (!rows.length) {

@@ -1,20 +1,17 @@
-# Use an official Node.js runtime as a parent image
-FROM node:20-alpine
+# syntax=docker/dockerfile:1
 
-# Set the working directory inside the container
+FROM node:20-bookworm-slim AS deps
 WORKDIR /usr/src/app
 
-# Copy package.json and package-lock.json
 COPY package*.json ./
-
-# Install production dependencies
 RUN npm ci --omit=dev
 
-# Copy the rest of the application code
+FROM node:20-bookworm-slim AS runner
+WORKDIR /usr/src/app
+ENV NODE_ENV=production
+
+COPY --from=deps /usr/src/app/node_modules ./node_modules
 COPY . .
 
-# Expose the port the app runs on
 EXPOSE 3021
-
-# Start the server
 CMD ["node", "server.js"]

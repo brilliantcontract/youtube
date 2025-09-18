@@ -674,8 +674,9 @@ async function scrapeNotScrapedChannels() {
                         other_links,
                         verification,
                         thumbnail,
-                        access_type
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        access_type,
+                        country
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON DUPLICATE KEY UPDATE
                         description = VALUES(description),
                         videos = VALUES(videos),
@@ -702,7 +703,8 @@ async function scrapeNotScrapedChannels() {
                             otherLinksJson,
                             info.verification || 'Unverified',
                             info.thumbnail || '',
-                            info.accessType || 'DIRECT'
+                            info.accessType || 'DIRECT',
+                            info.country || 'Unknown'
                         ]
                     );
 

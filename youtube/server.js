@@ -164,11 +164,15 @@ function extractChannelInfo(html) {
         if ((match = html.match(/"videoCountText":"([^"]+)"/))) {
             channelInfo.videoCount = match[1];
         }
-
+        if ((match = html.match(/"joinedDateText":\s*{\s*"content":"([^"]+)"/))) {
+            channelInfo.joinedDate = match[1];
+        }
         if ((match = html.match(/"category":"([^"]+)"/))) {
             channelInfo.category = match[1];
         }
-
+        if ((match = html.match(/"country":"([^"]+)"/))) {
+            channelInfo.country = match[1];
+        }
         if ((match = html.match(/"canonicalChannelUrl":"([^"]+)"/))) {
             channelInfo.canonicalUrl = match[1];
         }
@@ -191,13 +195,6 @@ function extractChannelInfo(html) {
         channelInfo.linkToTwitter = categorizedLinks.twitter;
         channelInfo.linkToTiktok = categorizedLinks.tiktok;
         channelInfo.otherLinks = categorizedLinks.other;
-                const tableMetadata = extractCountryAndJoinDate(html);
-        if (tableMetadata.joinDate) {
-            channelInfo.joinedDate = tableMetadata.joinDate;
-        }
-        if (tableMetadata.country) {
-            channelInfo.country = tableMetadata.country;
-        }
         channelInfo.verification = extractVerificationStatus(html);
         channelInfo.accessStatus = extractAccessType(html);
         channelInfo.views = channelInfo.viewCount;
@@ -264,81 +261,6 @@ function categorizeExternalLinks(links = []) {
 
     return categorized;
 }
-
-function extractCountryAndJoinDate(html) {
-    const result = { joinDate: '', country: '' };
-    if (!html) {
-        return result;
-    }
-
-    const rowRegex = /<tr[^>]*class\s*=\s*['"][^'"]*\bdescription-item\b[^'"]*['"][^>]*>([\s\S]*?)<\/tr>/gi;
-    let rowMatch;
-
-    while ((rowMatch = rowRegex.exec(html)) !== null) {
-        const rowContent = rowMatch[1];
-        const cells = [];
-        const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
-        let cellMatch;
-
-        while ((cellMatch = cellRegex.exec(rowContent)) !== null) {
-            cells.push(cellMatch[1]);
-        }
-
-        for (let i = 0; i < cells.length; i += 1) {
-            if (cellContainsIcon(cells[i], 'privacy_public')) {
-                if (!result.country && i + 1 < cells.length) {
-                    result.country = normalizeTableCellText(cells[i + 1]);
-                }
-            }
-
-            if (cellContainsIcon(cells[i], 'info_outline')) {
-                if (!result.joinDate && i + 1 < cells.length) {
-                    result.joinDate = normalizeTableCellText(cells[i + 1]);
-                }
-            }
-        }
-
-        if (result.joinDate && result.country) {
-            break;
-        }
-    }
-
-    return result;
-}
-
-function cellContainsIcon(cellContent, iconName) {
-    if (!cellContent) {
-        return false;
-    }
-
-    const iconPattern = new RegExp(`<yt-icon[^>]*icon\\s*=\\s*['\"]?${iconName}['\"]?`, 'i');
-    return iconPattern.test(cellContent);
-}
-
-function normalizeTableCellText(cellContent) {
-    if (!cellContent) {
-        return '';
-    }
-
-    const withoutTags = cellContent.replace(/<[^>]*>/g, ' ');
-    const collapsedWhitespace = withoutTags.replace(/\s+/g, ' ').trim();
-    return decodeHtmlEntities(collapsedWhitespace);
-}
-
-function decodeHtmlEntities(text) {
-    if (!text) {
-        return '';
-    }
-
-    return text
-        .replace(/&nbsp;/gi, ' ')
-        .replace(/&amp;/gi, '&')
-        .replace(/&quot;/gi, '"')
-        .replace(/&#39;/gi, "'")
-        .replace(/&lt;/gi, '<')
-        .replace(/&gt;/gi, '>');
-}
-
 
 function extractVerificationStatus(html) {
     try {

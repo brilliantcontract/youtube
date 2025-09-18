@@ -164,13 +164,19 @@ function extractChannelInfo(html) {
         if ((match = html.match(/"videoCountText":"([^"]+)"/))) {
             channelInfo.videoCount = match[1];
         }
-        if ((match = html.match(/"joinedDateText":\s*{\s*"content":"([^"]+)"/))) {
+        const joinDateFromSelectors = extractAboutChannelRowValue(html, 'info_outline');
+        if (joinDateFromSelectors) {
+            channelInfo.joinedDate = joinDateFromSelectors;
+        } else if ((match = html.match(/"joinedDateText":\s*{\s*"content":"([^"]+)"/))) {
             channelInfo.joinedDate = match[1];
         }
         if ((match = html.match(/"category":"([^"]+)"/))) {
             channelInfo.category = match[1];
         }
-        if ((match = html.match(/"country":"([^"]+)"/))) {
+        const countryFromSelectors = extractAboutChannelRowValue(html, 'privacy_public');
+        if (countryFromSelectors) {
+            channelInfo.country = countryFromSelectors;
+        } else if ((match = html.match(/"country":"([^"]+)"/))) {
             channelInfo.country = match[1];
         }
         if ((match = html.match(/"canonicalChannelUrl":"([^"]+)"/))) {
@@ -206,6 +212,119 @@ function extractChannelInfo(html) {
 
     return channelInfo;
 }
+
+function extractAboutChannelRowValue(html, iconName) {
+    if (typeof html !== 'string' || !html || typeof iconName !== 'string' || !iconName) {
+        return '';
+    }
+
+    const iconPattern = new RegExp(`<yt-icon\\b[^>]*\\bicon\\s*=\\s*['"]${escapeForRegex(iconName)}['"]`, 'i');
+    const rowRegex = /<tr\b([^>]*)>([\s\S]*?)<\/tr>/gi;
+    let rowMatch;
+
+    while ((rowMatch = rowRegex.exec(html)) !== null) {
+        const attributes = rowMatch[1] || '';
+        const rowContent = rowMatch[2] || '';
+        const classMatch = attributes.match(/class\s*=\s*(["'])([^"']*)\1/i);
+
+        if (!classMatch) {
+            continue;
+        }
+
+        const classValue = classMatch[2];
+        if (!/\bdescription-item\b/.test(classValue)) {
+            continue;
+        }
+
+        if (!iconPattern.test(rowContent)) {
+            continue;
+        }
+
+        const cellRegex = /<td\b([^>]*)>([\s\S]*?)<\/td>/gi;
+        let cellMatch;
+        let previousCellContainsIcon = false;
+
+        while ((cellMatch = cellRegex.exec(rowContent)) !== null) {
+            const cellContent = cellMatch[2] || '';
+
+            if (previousCellContainsIcon) {
+                const cleaned = cleanAboutCellText(cellContent);
+                if (cleaned) {
+                    return cleaned;
+                }
+            }
+
+            previousCellContainsIcon = iconPattern.test(cellContent);
+        }
+    }
+
+    return '';
+}
+
+function cleanAboutCellText(fragment) {
+    if (typeof fragment !== 'string' || !fragment) {
+        return '';
+    }
+
+    let text = fragment;
+    text = text.replace(/<script[\s\S]*?<\/script>/gi, '');
+    text = text.replace(/<style[\s\S]*?<\/style>/gi, '');
+    text = text.replace(/<br\s*\/?\s*>/gi, '\n');
+    text = text.replace(/<[^>]+>/g, '');
+    text = decodeBasicHtmlEntities(text);
+    text = text.replace(/\s+/g, ' ');
+
+    return text.trim();
+}
+
+function decodeBasicHtmlEntities(text) {
+    if (typeof text !== 'string' || !text) {
+        return '';
+    }
+
+    return text.replace(/&(#(?:x[0-9a-fA-F]+|\d+)|[a-zA-Z]+);/g, function (match, entity) {
+        if (!entity) {
+            return match;
+        }
+
+        if (entity.charAt(0) === '#') {
+            const isHex = entity.charAt(1) === 'x' || entity.charAt(1) === 'X';
+            const number = parseInt(entity.slice(isHex ? 2 : 1), isHex ? 16 : 10);
+
+            if (!Number.isNaN(number)) {
+                return String.fromCodePoint(number);
+            }
+
+            return match;
+        }
+
+        switch (entity.toLowerCase()) {
+            case 'amp':
+                return '&';
+            case 'lt':
+                return '<';
+            case 'gt':
+                return '>';
+            case 'quot':
+                return '"';
+            case 'apos':
+                return "'";
+            case 'nbsp':
+                return ' ';
+            default:
+                return match;
+        }
+    });
+}
+
+function escapeForRegex(value) {
+    if (typeof value !== 'string' || !value) {
+        return '';
+    }
+
+    return value.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+}
+
 
 function extractExternalLinks(html) {
     const links = [];
